@@ -16,4 +16,6 @@ services:
       - key: DISCORD_GUILD_ID
         sync: false
       - key: PGS_MODEL
-        value: glm-5.2
+        value: deepseek-v4-flash-0731
+      - key: PGS_BASE_URL
+        value: https://api.pgsgrove.com/v1
