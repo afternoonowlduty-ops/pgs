@@ -1,21 +1,15 @@
-"""Python 3.11+
-Install: python -m pip install -U discord.py openai python-dotenv
-Create .env alongside this script (never commit or share it):
-DISCORD_TOKEN=your_discord_bot_token
-PGS_API_KEY=your_phoenix_grove_key
-PGS_MODEL=glm-5.2
-# Optional: sync commands immediately to a development server:
-# DISCORD_GUILD_ID=your_server_id
-
-Run: python grove_bot.py
-Commands: /ask prompt, /reset
-Conversations live in memory, separately per user and channel.
+"""Python 3.11+. Run: python grove_bot.py
+Enable Message Content Intent in the Discord Developer Portal.
+Messages in channel 1512306846713643159 receive public replies.
+Each user's history is separate and held in memory only.
 """
-
 import asyncio
 import io
+import json
 import logging
 import os
+import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -28,65 +22,84 @@ load_dotenv(Path(__file__).with_name('.env'))
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('grove_bot')
 TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
-API_KEYS = list(dict.fromkeys(
-    key.strip() for key in
+API_KEYS = list(dict.fromkeys(key.strip() for key in
     (os.getenv('PGS_API_KEYS') or os.getenv('PGS_API_KEY', '')).split(',')
-    if key.strip()
-))
-MODEL = os.getenv('PGS_MODEL', 'glm-5.2')
+    if key.strip()))
+MODEL = os.getenv('PGS_MODEL', 'deepseek-v4-flash-0731').strip()
+BASE_URL = os.getenv('PGS_BASE_URL', 'https://api.pgsgrove.com/v1').strip().rstrip('/')
 GUILD_ID = os.getenv('DISCORD_GUILD_ID', '').strip()
+ALLOWED_CHANNEL_ID = 1512306846713643159
 SYSTEM = 'You are a helpful Discord assistant. Be clear and concise.'
 MAX_SESSIONS = 200
 MAX_MESSAGES = 12
 
+if not TOKEN or not API_KEYS:
+    raise SystemExit('Set DISCORD_TOKEN and PGS_API_KEYS in Render or your .env file.')
+if GUILD_ID and not GUILD_ID.isdigit():
+    raise SystemExit('DISCORD_GUILD_ID must be a numeric server ID.')
 
-ALLOWED_CHANNEL_ID = 1512306846713643159
 
-
-class ChannelRestrictedTree(app_commands.CommandTree):
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.channel_id != ALLOWED_CHANNEL_ID:
-            await interaction.response.send_message(
-                f'Use this bot only in <#{ALLOWED_CHANNEL_ID}>.',
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return False
-        return True
+def billing_diagnostic(exc, key_slot):
+    body = exc.body
+    details = body.get('error', body) if isinstance(body, dict) else {}
+    if not isinstance(details, dict):
+        details = {}
+    data = {'status': exc.status_code, 'model': MODEL, 'key_slot': key_slot,
+            'message': details.get('message', 'No structured error message returned.'),
+            'type': details.get('type'), 'code': details.get('code'),
+            'request_id': exc.response.headers.get('x-request-id')}
+    text = json.dumps(data, ensure_ascii=False)
+    for secret in [TOKEN, *API_KEYS]:
+        text = text.replace(secret, '[REDACTED]')
+    text = re.sub(r'pgsk_[A-Za-z0-9_-]+', '[REDACTED]', text)
+    log.warning('Provider billing diagnostic: %s', text[:4000])
 
 
 class GroveBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default(),
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents,
                          allowed_mentions=discord.AllowedMentions.none())
-        self.tree = ChannelRestrictedTree(self)
-        self.apis = [AsyncOpenAI(
-            api_key=key, base_url='https://api.pgsgrove.com/v1',
-            timeout=90.0, max_retries=0) for key in API_KEYS]
+        self.tree = app_commands.CommandTree(self)
+        self.apis = [AsyncOpenAI(api_key=key, base_url=BASE_URL,
+                     timeout=90.0, max_retries=0) for key in API_KEYS]
         self.next_key = 0
         self.history = OrderedDict()
+        self.cooldowns = OrderedDict()
         self.busy = set()
         self.slots = asyncio.Semaphore(3)
+        self.commands_cleaned = False
 
     async def setup_hook(self):
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        # Remove the old global slash commands for this dedicated bot.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
 
     async def on_ready(self):
-        log.info('Connected as %s. Model: %s', self.user, MODEL)
+        log.info('Connected as %s. Model: %s. Direct chat channel: %s',
+                 self.user, MODEL, ALLOWED_CHANNEL_ID)
+        if not self.commands_cleaned:
+            self.commands_cleaned = True
+            # Remove old guild-scoped commands, including the previous /ask.
+            guild_ids = {g.id for g in self.guilds}
+            if GUILD_ID:
+                guild_ids.add(int(GUILD_ID))
+            for guild_id in guild_ids:
+                try:
+                    guild = discord.Object(id=guild_id)
+                    self.tree.clear_commands(guild=guild)
+                    await self.tree.sync(guild=guild)
+                except discord.HTTPException as exc:
+                    log.warning('Could not remove old commands for guild %s: %s',
+                                guild_id, type(exc).__name__)
 
     async def start(self, token, *, reconnect=True):
         from aiohttp import web
 
         async def health(request):
-            return web.json_response({
-                'status': 'running',
-                'discord_connected': self.is_ready(),
-            })
+            return web.json_response({'status': 'running',
+                                      'discord_connected': self.is_ready()})
 
         app = web.Application()
         app.router.add_get('/', health)
@@ -105,146 +118,96 @@ class GroveBot(discord.Client):
         await asyncio.gather(*(api.close() for api in self.apis))
         await super().close()
 
+    async def reply(self, message, text, **kwargs):
+        try:
+            await message.reply(text, mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                                **kwargs)
+        except discord.HTTPException as exc:
+            log.warning('Discord reply failed (%s)', type(exc).__name__)
 
-# Keep initialization errors readable; never log credentials.
-if not TOKEN or not API_KEYS:
-    raise SystemExit('Set DISCORD_TOKEN and PGS_API_KEYS in Render or your .env file.')
-if GUILD_ID and not GUILD_ID.isdigit():
-    raise SystemExit('DISCORD_GUILD_ID must be a numeric server ID.')
-
-bot = GroveBot()
-
-
-@bot.tree.command(name='ask', description='Ask AI through Phoenix Grove')
-@app_commands.describe(prompt='Your question (sent to Phoenix Grove)')
-@app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
-async def ask(interaction: discord.Interaction, prompt: str):
-    if not prompt.strip() or len(prompt) > 6000:
-        await interaction.response.send_message(
-            'Enter a question between 1 and 6,000 characters.', ephemeral=True)
-        return
-    # A user can have only one in-flight request across all channels.
-    if interaction.user.id in bot.busy:
-        await interaction.response.send_message(
-            'Wait for your current answer to finish.', ephemeral=True)
-        return
-    key = (interaction.guild_id, interaction.channel_id, interaction.user.id)
-    bot.busy.add(interaction.user.id)
-    try:
-        # Private replies avoid publishing user questions and AI responses.
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        conversation = list(bot.history.get(key, []))
-        conversation.append({'role': 'user', 'content': prompt})
-        async with asyncio.timeout(120):
-            async with bot.slots:
-                api = bot.apis[bot.next_key]
-                bot.next_key = (bot.next_key + 1) % len(bot.apis)
-                response = await api.chat.completions.create(
-                    model=MODEL,
-                    messages=[{'role': 'system', 'content': SYSTEM}] + conversation,
-                    max_tokens=1500,
-                )
-        answer = (response.choices[0].message.content or '').strip()
-        if not answer:
-            await interaction.followup.send(
-                'The model returned no text. Try rephrasing your question.',
-                ephemeral=True)
+    async def on_message(self, message):
+        if (message.author.bot or message.webhook_id or not message.guild
+                or message.channel.id != ALLOWED_CHANNEL_ID):
             return
-        conversation.append({'role': 'assistant', 'content': answer})
-        bot.history[key] = conversation[-MAX_MESSAGES:]
-        bot.history.move_to_end(key)
-        while len(bot.history) > MAX_SESSIONS:
-            bot.history.popitem(last=False)
-        if len(answer) <= 1900:
-            await interaction.followup.send(answer, ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none())
-        else:
-            await interaction.followup.send(
-                'Your answer is attached because it exceeds Discord’s message limit.',
-                file=discord.File(io.BytesIO(answer.encode('utf-8')),
-                                  filename='answer.txt'), ephemeral=True)
-    except (APITimeoutError, asyncio.TimeoutError):
-        await interaction.followup.send('The request timed out. Try again shortly.',
-                                        ephemeral=True)
-    except APIConnectionError:
-        await interaction.followup.send('Could not connect to Phoenix Grove.',
-                                        ephemeral=True)
-    except APIStatusError as exc:
-        if exc.status_code == 402:
-            import json
-            import re
-
-            def redact(value):
-                text = str(value)
-                for secret in [TOKEN, *API_KEYS]:
-                    if secret:
-                        text = text.replace(secret, '[REDACTED]')
-                return re.sub(r'pgsk_[A-Za-z0-9_-]+', '[REDACTED]', text)
-
-            body = exc.body
-            details = body.get('error', body) if isinstance(body, dict) else {}
-            if not isinstance(details, dict):
-                details = {}
-            diagnostic = {
-                'status': 402,
-                'model': MODEL,
-                'key_slot': bot.apis.index(api) + 1,
-                'message': details.get('message', 'No structured error message returned.'),
-                'type': details.get('type'),
-                'code': details.get('code'),
-                'request_id': exc.response.headers.get('x-request-id'),
-            }
-            safe_details = redact(json.dumps(diagnostic, ensure_ascii=False))[:4000]
-            log.warning('Provider billing diagnostic: %s', safe_details)
-            await interaction.followup.send(
-                'The API returned HTTP 402. The redacted provider details are '
-                'in the Render logs for the bot owner to inspect.',
-                ephemeral=True)
+        prompt = message.content.strip()
+        if not prompt:
+            if message.attachments:
+                await self.reply(message, 'Please send a text question; attachments are not processed.')
             return
-        messages = {
-            401: 'Phoenix Grove rejected the API key. Ask the bot owner to check it.',
-            402: 'The Phoenix Grove account needs additional credits.',
-            403: 'Phoenix Grove denied access to this request or model.',
-            429: 'Phoenix Grove is rate limiting requests. Try again shortly.',
-        }
-        await interaction.followup.send(messages.get(exc.status_code,
-            f'Phoenix Grove returned HTTP {exc.status_code}. Check the model and account.'),
-            ephemeral=True)
-    except Exception as exc:
-        log.error('Request failed (%s)', type(exc).__name__)
-        if interaction.response.is_done():
-            await interaction.followup.send('Unable to complete this request.',
-                                            ephemeral=True)
-        else:
-            await interaction.response.send_message('Unable to complete this request.',
-                                                     ephemeral=True)
-    finally:
-        bot.busy.discard(interaction.user.id)
-
-
-@bot.tree.command(name='reset', description='Clear your AI conversation in this channel')
-async def reset(interaction: discord.Interaction):
-    if interaction.user.id in bot.busy:
-        await interaction.response.send_message('Wait for your answer, then reset.',
-                                                 ephemeral=True)
-        return
-    key = (interaction.guild_id, interaction.channel_id, interaction.user.id)
-    bot.history.pop(key, None)
-    await interaction.response.send_message('Your conversation has been cleared.',
-                                             ephemeral=True)
-
-
-@bot.tree.error
-async def command_error(interaction: discord.Interaction,
-                        error: app_commands.AppCommandError):
-    text = (f'Please wait {error.retry_after:.0f} seconds before asking again.'
-            if isinstance(error, app_commands.CommandOnCooldown)
-            else 'The command failed. Try again shortly.')
-    if interaction.response.is_done():
-        await interaction.followup.send(text, ephemeral=True)
-    else:
-        await interaction.response.send_message(text, ephemeral=True)
+        if len(prompt) > 6000:
+            await self.reply(message, 'Keep your message under 6,001 characters.')
+            return
+        user_id = message.author.id
+        if user_id in self.busy:
+            await self.reply(message, 'Wait for your current answer to finish.')
+            return
+        now = time.monotonic()
+        if now - self.cooldowns.get(user_id, -100) < 10:
+            await self.reply(message, 'Please wait 10 seconds between questions.')
+            return
+        # Bound queued work as well as active API requests.
+        if len(self.busy) >= 20:
+            await self.reply(message, 'The bot is busy. Please try again shortly.')
+            return
+        self.cooldowns[user_id] = now
+        self.cooldowns.move_to_end(user_id)
+        while len(self.cooldowns) > 10000:
+            self.cooldowns.popitem(last=False)
+        self.busy.add(user_id)
+        key = (message.guild.id, message.channel.id, user_id)
+        key_slot = None
+        try:
+            conversation = list(self.history.get(key, []))
+            conversation.append({'role': 'user', 'content': prompt})
+            async with message.channel.typing():
+                async with asyncio.timeout(120):
+                    async with self.slots:
+                        key_slot = self.next_key + 1
+                        api = self.apis[self.next_key]
+                        self.next_key = (self.next_key + 1) % len(self.apis)
+                        response = await api.chat.completions.create(
+                            model=MODEL,
+                            messages=[{'role': 'system', 'content': SYSTEM}] + conversation,
+                            max_tokens=1500)
+            answer = (response.choices[0].message.content or '').strip()
+            if not answer:
+                await self.reply(message, 'The model returned no text. Try rephrasing.')
+                return
+            conversation.append({'role': 'assistant', 'content': answer})
+            self.history[key] = conversation[-MAX_MESSAGES:]
+            self.history.move_to_end(key)
+            while len(self.history) > MAX_SESSIONS:
+                self.history.popitem(last=False)
+            if len(answer) <= 1900:
+                await self.reply(message, answer)
+            else:
+                await self.reply(message, 'Your answer is attached.',
+                    file=discord.File(io.BytesIO(answer.encode('utf-8')),
+                                      filename='answer.txt'))
+        except (APITimeoutError, asyncio.TimeoutError):
+            await self.reply(message, 'The request timed out. Try again shortly.')
+        except APIConnectionError:
+            await self.reply(message, 'Could not connect to the AI provider.')
+        except APIStatusError as exc:
+            if exc.status_code == 402:
+                billing_diagnostic(exc, key_slot)
+                await self.reply(message, 'The API returned HTTP 402. The bot owner can inspect the redacted provider details in Render logs.')
+            else:
+                errors = {
+                    401: 'The provider rejected the API key. Ask the bot owner to check it.',
+                    403: 'The provider denied access to this request or model.',
+                    404: 'The configured model was not found.',
+                    429: 'The provider is rate limiting requests. Try again shortly.',
+                }
+                await self.reply(message, errors.get(exc.status_code,
+                    f'The AI provider returned HTTP {exc.status_code}.'))
+        except Exception as exc:
+            log.error('Request failed (%s)', type(exc).__name__)
+            await self.reply(message, 'Unable to complete this request.')
+        finally:
+            self.busy.discard(user_id)
 
 
 if __name__ == '__main__':
-    bot.run(TOKEN)
+    GroveBot().run(TOKEN)
