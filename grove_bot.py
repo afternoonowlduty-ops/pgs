@@ -170,6 +170,37 @@ async def ask(interaction: discord.Interaction, prompt: str):
         await interaction.followup.send('Could not connect to Phoenix Grove.',
                                         ephemeral=True)
     except APIStatusError as exc:
+        if exc.status_code == 402:
+            import json
+            import re
+
+            def redact(value):
+                text = str(value)
+                for secret in [TOKEN, *API_KEYS]:
+                    if secret:
+                        text = text.replace(secret, '[REDACTED]')
+                return re.sub(r'pgsk_[A-Za-z0-9_-]+', '[REDACTED]', text)
+
+            body = exc.body
+            details = body.get('error', body) if isinstance(body, dict) else {}
+            if not isinstance(details, dict):
+                details = {}
+            diagnostic = {
+                'status': 402,
+                'model': MODEL,
+                'key_slot': bot.apis.index(api) + 1,
+                'message': details.get('message', 'No structured error message returned.'),
+                'type': details.get('type'),
+                'code': details.get('code'),
+                'request_id': exc.response.headers.get('x-request-id'),
+            }
+            safe_details = redact(json.dumps(diagnostic, ensure_ascii=False))[:4000]
+            log.warning('Provider billing diagnostic: %s', safe_details)
+            await interaction.followup.send(
+                'The API returned HTTP 402. The redacted provider details are '
+                'in the Render logs for the bot owner to inspect.',
+                ephemeral=True)
+            return
         messages = {
             401: 'Phoenix Grove rejected the API key. Ask the bot owner to check it.',
             402: 'The Phoenix Grove account needs additional credits.',
