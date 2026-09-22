@@ -247,5 +247,3 @@ class GroveBot(discord.Client):
 
 if __name__ == '__main__':
     GroveBot().run(TOKEN)
-
-```*
